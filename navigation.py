@@ -7,7 +7,7 @@ from threading import Thread
 pg.init()
 SCALE = 0.1
 SCREEN = pg.display.set_mode((0, 0), pg.FULLSCREEN)
-CLOCK = pg.Clock()
+CLOCK = pg.time.Clock()
 
 
 class Map:
@@ -118,7 +118,6 @@ class Robot(pg.sprite.Sprite):
         self.image = pg.transform.rotate(surf, self.rot/np.pi*180)
         self.rect = self.image.get_rect()
         self.rect.center = center
-        pg.image.save(self.image, 'robot.png')
 
 
 class MapDisplay(pg.sprite.Sprite):
