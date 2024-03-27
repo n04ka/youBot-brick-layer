@@ -2,6 +2,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pygame as pg
 from threading import Thread
+import networkx as nx
+from scipy.spatial import Voronoi
+import cv2 as cv2
 
 
 pg.init()
@@ -16,7 +19,15 @@ class Map:
         self.pos = np.array(pos, dtype=np.int16)
         self.array = np.zeros(shape, dtype=np.uint16)
         self.scale = scale
+
+
+    def absolute2map(self, coords: np.ndarray) -> tuple[int, int]:
+        return tuple(((coords - self.pos) // self.scale).astype(int))
     
+
+    def map2absolute(self, coords: tuple | np.ndarray) -> np.ndarray:
+        return np.array(coords) * self.scale + self.pos
+
     
     def __contains__(self, value) -> bool:
         i = np.array(value)
@@ -38,12 +49,12 @@ class Map:
         i = np.array(key)
         index = i - self.pos[:i.size]
         self.array[*index] = value
-    
-    
+
+
     def limits(self) -> tuple[np.ndarray, np.ndarray]:
         return self.pos, self.pos + self.array.shape
-    
-    
+
+
     def update(self, other):
         if self.scale != other.scale:
             raise ValueError(f'Масштаб карт при сложении отличается: {self.scale} и {other.scale}')
@@ -120,6 +131,113 @@ class Robot(pg.sprite.Sprite):
         self.rect.center = center
 
 
+class Navigator:
+
+    def __init__(self, world_map: Map, robot: Robot) -> None:
+        self.map = world_map
+        self.robot = robot
+        self.graph = nx.Graph()
+        self.methods = {'cell' : self.cell_graph,
+                        'voronoi' : self.voronoi_graph,
+                        'A*' : self. a_star}
+
+
+    def go_to(self, target: np.ndarray, algorithm: str = 'A*', graph_creation: str = 'cell') -> list[tuple]:
+        bitmap = ~cv2.threshold(self.map.array, 10, 1, cv2.THRESH_BINARY)[1].astype(bool)
+        plt.subplot(1, 2, 1)
+        plt.gca().set_aspect('equal')
+        plt.imshow(bitmap)
+        self.graph = self.methods[graph_creation](bitmap)
+        path = self.methods[algorithm](self.graph, target)
+        return path
+
+
+    def cell_graph(self, bitmap: np.ndarray) -> nx.Graph:
+        xs, ys = np.array(range(bitmap.shape[0])), np.array(range(bitmap.shape[1]))
+        cells = np.stack(np.meshgrid(xs, ys), axis=2)
+        free_cells = cells[bitmap.transpose()].reshape((-1, 2))
+
+        graph = nx.Graph()
+        graph.add_nodes_from([tuple(coord) for coord in free_cells])
+
+        for node in graph.nodes:
+            coord = np.array(node)
+            for move in ((0, 1), (1, 0), (1, 1), (1, -1)):
+                neighbour = tuple(coord + np.array(move))
+                if neighbour not in graph.nodes:
+                    continue
+                checks = {(1, 1) : [coord+np.array([1, 0]), coord+np.array([0, 1])],
+                        (1, -1) : [coord+np.array([0, -1]), coord+np.array([1, 0])]}
+                if move in checks:
+                    if not all([tuple(block) in graph.nodes for block in checks[move]]):
+                        continue
+                graph.add_edge(node, neighbour, weight=np.linalg.norm(np.array(move)))
+        plt.subplot(1, 2, 2)
+        plt.gca().invert_yaxis()
+        plt.gca().set_aspect('equal')
+        nx.draw(graph, pos={node : node[::-1] for node in graph.nodes}, node_size=2, width=0.5)
+        plt.show()
+        return graph
+
+
+    def voronoi_graph(self, bitmap: np.ndarray) -> nx.Graph:
+        xs, ys = np.array(range(bitmap.shape[0])), np.array(range(bitmap.shape[1])), 
+        cells = np.stack(np.meshgrid(xs, ys), axis=2)
+        obstacles = cells[~bitmap.transpose()].reshape((-1, 2))
+
+        diagram = Voronoi(obstacles)
+        pos = {i : coord for i, coord in enumerate(diagram.vertices)}
+        graph = nx.Graph()
+        graph.add_nodes_from(pos)
+        graph.add_node(-1)
+        graph.add_edges_from(diagram.ridge_vertices)
+        graph.remove_node(-1)
+
+        for node in pos:
+            try:
+                if not bitmap[*np.round(pos[node]).astype(int)]:
+                    graph.remove_node(node)
+            except IndexError:
+                graph.remove_node(node)
+        
+        nx.set_edge_attributes(graph, {(start, end) : np.linalg.norm(pos[start]-pos[end]) for start, end in graph.edges}, 'weight')
+        return graph
+
+
+    def a_star(self, graph: nx.graph, target: tuple) -> list:
+        norm = np.linalg.norm
+        START = self.map.absolute2map(display.display2absolute(np.array(self.robot.rect.center)))
+        FINISH = target
+        nx.set_node_attributes(graph, {node : norm(np.array(FINISH)-np.array(node)) for node in graph.nodes}, 'weight')
+        nx.set_node_attributes(graph, np.inf, 'path')
+        nx.set_node_attributes(graph, {START : 0.}, 'path')
+        nx.set_node_attributes(graph, {START : graph.nodes[START]['weight']}, 'cost')
+
+        front: dict[tuple, tuple | None] = {START : None}
+        visited = {}
+
+        while True:
+            new_node = min(front, key = lambda node: graph.nodes[node]['cost'])
+            visited[new_node] = front[new_node]
+            front.pop(new_node)
+            
+            if new_node == FINISH:
+                break
+            
+            for n in graph.neighbors(new_node):
+                if n in visited:
+                    continue
+                if graph.nodes[new_node]['path'] + graph.edges[n, new_node]['weight'] < graph.nodes[n]['path'] or n not in front:
+                    nx.set_node_attributes(graph, {n : graph.nodes[new_node]['path'] + graph.edges[n, new_node]['weight']}, 'path')
+                    nx.set_node_attributes(graph, {n : graph.nodes[n]['path'] + graph.nodes[n]['weight']}, 'cost')
+                    front[n] = new_node
+
+        path = [FINISH]
+        while path[-1]:
+            path.append(visited[path[-1]])
+        return path
+
+
 class MapDisplay(pg.sprite.Sprite):
     
     def __init__(self, owner: Map, scale: float = 10.) -> None:
@@ -137,6 +255,10 @@ class MapDisplay(pg.sprite.Sprite):
     def display2absolute(self, coords: np.ndarray):
         return (coords / self.scale + self.owner.pos[::-1]) * self.owner.scale
     
+
+    def draw_path(self, path: list[tuple]):
+        pg.draw.aalines(self.image, (0, 0, 255), True, path)
+
     
     def update(self):
         self.image = pg.transform.scale_by(pg.surfarray.make_surface(gray(self.owner.array.transpose())), self.scale)
@@ -145,6 +267,8 @@ class MapDisplay(pg.sprite.Sprite):
 world_map = Map((0, 0), (0, 0), SCALE)
 robot = Robot()
 display = MapDisplay(world_map)
+navigator = Navigator(world_map, robot)
+
 
 def update_map():
     with open(f"examples/examp7.txt") as file:
@@ -160,23 +284,34 @@ def update_map():
 def visualize():
     running = True  
     while running:
+
+        displays.update()
+        robots.update()
+
         for event in pg.event.get():
             if event.type == pg.QUIT or (event.type == pg.KEYDOWN and event.key == pg.K_q):
                 running = False
             elif event.type == pg.MOUSEBUTTONDOWN:
                 x, y = event.pos
-                print(display.display2absolute(np.array([x-display.rect.topleft[0], y]))) # type: ignore
-                
-        displays.update()
-        robots.update()
-        
+                target = display.display2absolute(np.array([x-display.rect.topleft[0], y]))
+                path = navigator.go_to(target)
+                display.draw_path(path)
+                print(target)
+                      
         SCREEN.fill((128, 128, 128))
-        robots.draw(display.image) # type: ignore
+        robots.draw(display.image)
         displays.draw(SCREEN)
         font = pg.font.SysFont(None, 24)
-        x, y = display.display2absolute(np.array(robot.rect.center)) # type: ignore
-        surf = font.render(f'Robot pos: {x:.2f}, {y:.2f}', True, (0, 0, 0))
-        SCREEN.blit(surf, (20, 20))
+        x_r, y_r = display.display2absolute(np.array(robot.rect.center))
+        x_m, y_m = pg.mouse.get_pos()
+        lines = [f'Robot pos: {x_r:.2f}, {y_r:.2f}',
+                 f'Screen mouse pos: {x_m}, {y_m}',
+                 f'Display mouse pos: {x_m-200}, {y_m}',
+                 f'Absolute mouse pos: {display.display2absolute(np.array([x_m-200, y_m]))}',
+                 f'Map mouse pos: {world_map.absolute2map(display.display2absolute(np.array([x_m-200, y_m])))}']
+        for i, line in enumerate(lines):
+            surf = font.render(line, True, (0, 0, 0))
+            SCREEN.blit(surf, (20, i*20+20))
         CLOCK.tick(60)
         pg.display.flip()
     pg.quit()
