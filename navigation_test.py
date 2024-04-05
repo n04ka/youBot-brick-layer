@@ -2,6 +2,7 @@ import numpy as np
 from numpy.linalg import norm
 import matplotlib.pyplot as plt
 import pygame as pg
+import threading as thr
 import networkx as nx
 import cv2 as cv2
 
@@ -10,22 +11,21 @@ class Map:
     
     def __init__(self, pos: tuple, shape: tuple, scale: float) -> None:
         self.pos = np.array(pos, dtype=np.int16)
-        self.array = np.zeros(shape, dtype=np.uint32)
+        self.array = np.zeros(shape, dtype=np.uint16)
         self.scale = scale
 
 
-    def absolute2map(self, coords: np.ndarray) -> np.ndarray:
-        return (coords // self.scale).astype(int)
+    def absolute2map(self, coords: np.ndarray) -> tuple:
+        return tuple((coords // self.scale).astype(int)[::-1])
     
 
-    def map2absolute(self, coords: np.ndarray) -> np.ndarray:
-        return np.array(coords) * self.scale
+    def map2absolute(self, coords: tuple | np.ndarray) -> np.ndarray:
+        return np.array(coords[::-1]) * self.scale
 
     
     def get_bitmap(self) -> np.ndarray:
-        bitmap = cv2.threshold(self.array.astype(np.float32), 10, 1, cv2.THRESH_BINARY)[1]
-        kernel = np.zeros([int(np.ceil((0.54**2 + 0.4**2)**.5/self.scale))]*2, int)
-        cv2.circle(kernel, np.array(kernel.shape)//2, kernel.shape[0]//2, 1, -1) # type: ignore
+        bitmap = cv2.threshold(self.array, 10, 1, cv2.THRESH_BINARY)[1]
+        kernel = np.ones((3, 3))
         return ~cv2.filter2D(bitmap, -1, kernel).astype(bool)
     
     
@@ -62,7 +62,7 @@ class Map:
         low2, high2 = other.limits()
         new_pos = np.min(np.vstack((low1, low2)), axis=0)
         new_high = np.max(np.vstack((high1, high2)), axis=0)
-        new_array = np.zeros(new_high-new_pos, dtype=np.uint32)
+        new_array = np.zeros(new_high-new_pos, dtype=np.uint16)
         new_array[*[slice(l, h) for l, h in zip(low1-new_pos, low1-new_pos + np.array(self.array.shape))]] += self.array
         new_array[*[slice(l, h) for l, h in zip(low2-new_pos, low2-new_pos + np.array(other.array.shape))]] += other.array
         self.pos = new_pos
@@ -71,7 +71,7 @@ class Map:
 
     def show(self):
         x_min, y_max, x_max, y_min = np.concatenate(self.limits())*self.scale
-        plt.imshow(self.array, cmap='gray_r', vmax=10, extent=[y_max, y_min, x_min, x_max])
+        plt.imshow(self.array, cmap='gray_r', extent=[y_max, y_min, x_max, x_min])
         plt.gca().set_aspect('equal')
         plt.colorbar()
         plt.grid(which='both')
@@ -92,9 +92,9 @@ class RRT_star:
         self.finish_node = None
     
     
-    def check_intersection(self, start: np.ndarray, end: np.ndarray, num: int = 20) -> bool:
-        line = np.linspace(start, end, num, endpoint=True)
-        return all([self.bitmap[*(np.array(self.map.absolute2map(np.array([-y, x])), dtype=np.int16)-1-self.map.pos)] for x, y in line])
+    def check_intersection(self, start: np.ndarray, end: np.ndarray) -> bool:
+        line = np.linspace(start, end, 10, endpoint=True)
+        return all([self.bitmap[*np.array(self.map.absolute2map(point), dtype=np.int16)-self.map.pos] for point in line])
     
         
     def recalculate_weights(self, root: int):
@@ -108,22 +108,14 @@ class RRT_star:
         closest = min(self.graph, key = lambda node: norm(self.pos[node]-point))
         projection = self.segment*(point-self.pos[closest])/norm(point-self.pos[closest])
         new_point = point if norm(point-self.pos[closest]) < norm(projection) else self.pos[closest] + projection
-
+        
         neighbours = {node : self.graph.nodes[node]['weight'] + norm(self.pos[node]-new_point)
                     for node in self.pos
                     if norm(self.pos[node]-new_point) <= self.segment*3 and 
                     self.check_intersection(self.pos[node], new_point)}
     
         if not neighbours:
-            return
-        
-        if self.graph.number_of_nodes() > 2000:
-            self.map.show()
-            nx.draw(self.graph, self.pos, node_size=5, width=1)
-            plt.axis('on')
-            plt.gca().tick_params(left=True, bottom=True, labelleft=True, labelbottom=True)
-            plt.show()    
-            raise RuntimeError('Cannot find the path') 
+            return        
         
         node = len(self.pos)
         self.pos[node] = new_point
@@ -141,12 +133,9 @@ class RRT_star:
     
     
     def run(self):
-        x, y = self.finish
-        if not self.bitmap[*(np.array(self.map.absolute2map(np.array([-y, x])), dtype=np.int16)-1-self.map.pos)]:
-            raise RuntimeError('Finish in obstacle')
         i = 0
         searching = True
-        while searching or i < 200:
+        while searching and i < 10000:
             new_point = np.random.uniform(*[self.map.map2absolute(point) for point in self.map.limits()])
             added_node = self.update_graph(new_point)
             
@@ -160,20 +149,11 @@ class RRT_star:
                 finish_node = node
                 self.graph.add_node(node, weight=self.graph.nodes[added_node]['weight'] + dist_to_finish)
                 self.graph.add_edge(added_node, node)
-                if searching:
-                    print('path found')
                 searching = False
-                
             
             if not searching:
                 i += 1 
 
-        
-        # self.map.show()
-        # nx.draw(self.graph, self.pos, node_size=5, width=1)
-        # plt.axis('on')
-        # plt.gca().tick_params(left=True, bottom=True, labelleft=True, labelbottom=True)
-        # plt.show()     
         path = [finish_node]
         while path[-1]:
             path.append(*self.graph.predecessors(path[-1]))
@@ -187,26 +167,6 @@ class RRT_star:
         return [self.pos[node] for node in path]
 
 
-def cloud2map(cloud: np.ndarray, scale: float) -> Map:
-    cloud[:, 1] *= -1
-    # plt.scatter(*cloud.transpose(), s=0.1)
-    # plt.gca().set_aspect('equal')
-    # plt.title('Облако в системе координат карты')
-    # plt.show()
-    decomposed = (cloud // scale).astype(int)
-    decoposed_coords, counts = np.unique(decomposed, axis=0, return_counts=True)
-    x_min, y_min, x_max, y_max = *decoposed_coords.min(axis=0), *decoposed_coords.max(axis=0)
-    size = np.array([x_max - x_min + 1, y_max - y_min + 1])
-    TOPLEFT = np.array([x_min, y_min])
-    cell_map = np.zeros(size, dtype=np.uint32)
-    for coord, n in zip(decoposed_coords, counts):
-        cell_map[*(coord-TOPLEFT)] = n
-    cell_map = cell_map.transpose()
-    obj = Map(tuple(reversed(TOPLEFT)), cell_map.shape, scale)
-    obj.array = cell_map
-    return obj
-
-
 def new_measurement(coords: np.ndarray, data: np.ndarray, scale: float) -> Map:
     x, y, rot = coords
     angle = np.linspace(-2*np.pi/3, 2*np.pi/3, len(data))
@@ -216,7 +176,18 @@ def new_measurement(coords: np.ndarray, data: np.ndarray, scale: float) -> Map:
     ys = np.array([y + data * np.sin(rot-angle)]).transpose()
     points = np.hstack((xs, ys))
     points = points[~np.isnan(points).any(axis=1)]
-    return cloud2map(points, scale)
+    decomposed = (points // np.array([scale, scale])).astype(np.int16)
+    decoposed_coords, counts = np.unique(decomposed, axis=0, return_counts=True)
+    x_min, y_min, x_max, y_max = *decoposed_coords.min(axis=0), *decoposed_coords.max(axis=0)
+    size = np.array([x_max - x_min + 1, y_max - y_min + 1])
+    TOPLEFT = np.array([x_min, y_min])
+    cell_map = np.zeros(size, dtype=np.uint16)
+    for coord, n in zip(decoposed_coords, counts):
+        cell_map[*(coord-TOPLEFT)] = n
+    cell_map = cell_map.transpose()
+    obj = Map(tuple(reversed(TOPLEFT)), cell_map.shape, scale)
+    obj.array = cell_map
+    return obj
 
 
 def gray(im):
@@ -229,23 +200,21 @@ def gray(im):
 
 class Robot(pg.sprite.Sprite):
     
-    def __init__(self, scale: float, display_scale: float = 10) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self.scale = scale
-        self.display_scale = display_scale
-        self.rect = pg.Rect(0, 0, 0.531//scale*self.display_scale, 0.380//scale*self.display_scale)
+        self.rect = pg.Rect(0, 0, 0.531//SCALE*10, 0.380//SCALE*10)
         self.rot = 0.
         self.update()
     
     
     def move(self, coords: np.ndarray):
         self.rect.center = tuple(coords[:2]) #type: ignore
-        self.rot = coords[2]
+        self.rot = -coords[2]
      
     
     def update(self):
         center = self.rect.center #type: ignore
-        surf = pg.Surface((0.531//self.scale*self.display_scale, 0.380//self.scale*self.display_scale), pg.SRCALPHA) #type: ignore
+        surf = pg.Surface((0.531//SCALE*10, 0.380//SCALE*10), pg.SRCALPHA) #type: ignore
         surf.fill((255, 0, 0))
         self.image = pg.transform.rotate(surf, self.rot/np.pi*180)
         self.rect = self.image.get_rect()
@@ -266,13 +235,14 @@ class Navigator:
         # plt.imshow(bitmap)
         if algorithm == 'A*':
             self.graph = self.cell_graph(bitmap)
-            return self.a_star(self.graph, start, target)
+            return self.a_star(self.graph, target)
         
         return self.rrt_star(start, target)
 
 
     def rrt_star(self, start: np.ndarray, target: np.ndarray) -> list:
-        return RRT_star(start, target, self.map, .5).run()
+        start = display.display2absolute(start) #type: ignore
+        return RRT_star(start, target, self.map).run()
 
 
     def cell_graph(self, bitmap: np.ndarray) -> nx.Graph:
@@ -305,9 +275,9 @@ class Navigator:
         return graph
 
 
-    def a_star(self, graph: nx.Graph, start: np.ndarray, target: np.ndarray) -> list:
-        START = tuple(self.map.absolute2map(start)) #type: ignore
-        FINISH = tuple(self.map.absolute2map(target))
+    def a_star(self, graph: nx.Graph, target: np.ndarray) -> list:
+        START = self.map.absolute2map(display.display2absolute(np.array(self.robot.rect.center))) #type: ignore
+        FINISH = self.map.absolute2map(target)
         print(f'START: {START}, FINISH: {FINISH}')
         assert START in graph.nodes
         if FINISH not in graph.nodes:
@@ -343,46 +313,103 @@ class Navigator:
         path = [FINISH]
         while path[-1]:
             path.append(visited[path[-1]])
-        return [self.map.map2absolute(np.array(node)) for node in path[:-1]]
+        return [self.map.map2absolute(node) for node in path[:-1]]
       
 
 class MapDisplay(pg.sprite.Sprite):
     
-    def __init__(self, owner: Map, screen: pg.Surface, robot: Robot, scale: float = 10.) -> None:
+    def __init__(self, owner: Map, scale: float = 10.) -> None:
         super().__init__()
         self.owner = owner
-        self.robot = robot
         self.scale = scale
-        self.rect = pg.Rect(0, 0, screen.get_width(), screen.get_height())
+        self.rect = pg.Rect(200, 0, SCREEN.get_width()-200, SCREEN.get_height())
         self.path = []
         self.update()
         
     
-    def absolute2display(self, coords: np.ndarray) -> np.ndarray:
-        return self.map2display(self.owner.absolute2map(coords))
+    def absolute2display(self, coords: np.ndarray):
+        return (coords / self.owner.scale - self.owner.pos[::-1]) * self.scale
     
     
-    def display2absolute(self, coords: np.ndarray) -> np.ndarray:
-        return self.owner.map2absolute(self.display2map(coords))
-    
-    
-    def map2display(self, coords: np.ndarray) -> np.ndarray:
-        return ((coords - self.owner.pos) * self.scale)
-    
-    
-    def display2map(self, coords: np.ndarray) -> np.ndarray:
-        return (coords / self.scale + self.owner.pos)
+    def display2absolute(self, coords: np.ndarray):
+        return (coords / self.scale + self.owner.pos[::-1]) * self.owner.scale
     
 
     def draw_path(self, absolute_path: list[np.ndarray]):
-        x, y = np.array(absolute_path).transpose()
-        self.path = list(self.absolute2display(np.array([x, -y]).transpose()))
-    
+        self.path = [self.absolute2display(node) for node in absolute_path]
+
     
     def update(self):
-        padding = gray(50*(~self.owner.get_bitmap()).transpose().astype(np.uint8))
-        walls = gray(255 - cv2.threshold(self.owner.array.transpose().astype(np.float32), 10, 50, cv2.THRESH_BINARY)[1].astype(np.uint8))
-        self.image = pg.transform.scale_by(pg.surfarray.make_surface(padding-walls), self.scale)
+        self.image = pg.transform.scale_by(pg.surfarray.make_surface(gray(self.owner.array.transpose())), self.scale)
         if self.path:
             if len(self.path) > 1:
-                pg.draw.aalines(self.image, (0, 0, 255), False, self.path) # type: ignore
+                pg.draw.aalines(self.image, (0, 0, 255), False, self.path) #type: ignore
+            w = np.arctan2(robot.rect.center[1]-self.path[-1][1], robot.rect.center[0]-self.path[-1][0]) #type: ignore
+            robot.move(np.array([*self.path[-1], w])) #type: ignore
+            self.path.pop()
+
+
+if __name__ == '__main__':
+    pg.init()
+    SCALE = 0.1
+    SCREEN = pg.display.set_mode((0, 0), pg.FULLSCREEN)
+    CLOCK = pg.time.Clock()
+    world_map = Map((43, -33), (0, 0), SCALE)
+    robot = Robot()
+    display = MapDisplay(world_map)
+    navigator = Navigator(world_map)
+
+
+    def update_map():
+        with open(f"examples/examp7.txt", 'r') as file:
+            for line in file:
+                c, d = line.split("; ")
+                coords = np.array([float(number) for number in c.split(", ")])
+                data = np.array([float(number) for number in d.split(", ")])
+                world_map.update(new_measurement(coords, data, SCALE))
+                robot.move(np.array([*display.absolute2display(coords[:2]), coords[2]]))
+                CLOCK.tick(20)
+                
+                
+    def visualize():
+        running = True
+        pathfinding = thr.Thread()  
+        while running:
+
+            displays.update()
+            robots.update()
+
+            for event in pg.event.get():
+                if event.type == pg.QUIT or (event.type == pg.KEYDOWN and event.key == pg.K_q):
+                    running = False
+                elif event.type == pg.MOUSEBUTTONDOWN:
+                    x, y = event.pos
+                    target = display.display2absolute(np.array([x-display.rect.topleft[0], y])) #type: ignore
+                    pathfinding = thr.Thread(target = lambda: display.draw_path(navigator.go_to(display.display2absolute(np.array(robot.rect.center)), target, 'rrt')), daemon=True) #type: ignore
+                    pathfinding.start()
+                        
+            SCREEN.fill((128, 128, 128))
+            robots.draw(display.image) #type: ignore
+            displays.draw(SCREEN)
+            font = pg.font.SysFont(None, 24)
+            x_r, y_r = display.display2absolute(np.array(robot.rect.center)) #type: ignore
+            x_m, y_m = pg.mouse.get_pos()
+            lines = [f'Robot pos: {x_r:.2f}, {y_r:.2f}',
+                    f'Screen mouse pos: {x_m}, {y_m}',
+                    f'Display mouse pos: {x_m-200}, {y_m}',
+                    f'Absolute mouse pos: {display.display2absolute(np.array([x_m-200, y_m]))}',
+                    f'Map mouse pos: {world_map.absolute2map(display.display2absolute(np.array([x_m-200, y_m])))}']
+            for i, line in enumerate(lines):
+                surf = font.render(line, True, (0, 0, 0))
+                SCREEN.blit(surf, (20, i*20+20))
+            CLOCK.tick(15)
+            pg.display.flip()
+        pg.quit()
+
+
+    displays: pg.sprite.GroupSingle = pg.sprite.GroupSingle(display)
+    robots: pg.sprite.GroupSingle = pg.sprite.GroupSingle(robot)
+    update_thread = thr.Thread(target=update_map, daemon=True)
+    update_thread.start()
+    visualize()
+    update_thread.join()
