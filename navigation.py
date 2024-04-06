@@ -15,11 +15,12 @@ class Map:
 
 
     def absolute2map(self, coords: np.ndarray) -> np.ndarray:
-        return (coords // self.scale).astype(int)
-    
+        x, y = (coords / self.scale - self.pos)[::-1]
+        return np.array([self.array.shape[0]-x, y])
 
     def map2absolute(self, coords: np.ndarray) -> np.ndarray:
-        return np.array(coords) * self.scale
+        x, y = coords
+        return (np.array([self.array.shape[0]-x, y])[::-1] + self.pos) * self.scale
 
     
     def get_bitmap(self) -> np.ndarray:
@@ -94,7 +95,7 @@ class RRT_star:
     
     def check_intersection(self, start: np.ndarray, end: np.ndarray, num: int = 20) -> bool:
         line = np.linspace(start, end, num, endpoint=True)
-        return all([self.bitmap[*(np.array(self.map.absolute2map(np.array([-y, x])), dtype=np.int16)-1-self.map.pos)] for x, y in line])
+        return all([self.bitmap[*self.map.absolute2map(point).astype(np.int16)] for point in line])
     
         
     def recalculate_weights(self, root: int):
@@ -141,13 +142,12 @@ class RRT_star:
     
     
     def run(self):
-        x, y = self.finish
-        if not self.bitmap[*(np.array(self.map.absolute2map(np.array([-y, x])), dtype=np.int16)-1-self.map.pos)]:
+        if not self.bitmap[*self.map.absolute2map(self.finish).astype(np.int16)]:
             raise RuntimeError('Finish in obstacle')
         i = 0
         searching = True
         while searching or i < 200:
-            new_point = np.random.uniform(*[self.map.map2absolute(point) for point in self.map.limits()])
+            new_point = np.random.uniform(*np.array(self.map.limits())[::-1]*self.map.scale)
             added_node = self.update_graph(new_point)
             
             if not added_node:
@@ -367,16 +367,15 @@ class MapDisplay(pg.sprite.Sprite):
     
     
     def map2display(self, coords: np.ndarray) -> np.ndarray:
-        return ((coords - self.owner.pos) * self.scale)
+        return coords[::-1] * self.scale
     
     
     def display2map(self, coords: np.ndarray) -> np.ndarray:
-        return (coords / self.scale + self.owner.pos)
+        return coords[::-1] / self.scale
     
 
     def draw_path(self, absolute_path: list[np.ndarray]):
-        x, y = np.array(absolute_path).transpose()
-        self.path = list(self.absolute2display(np.array([x, -y]).transpose()))
+        self.path = [self.absolute2display(point) for point in absolute_path]
     
     
     def update(self):

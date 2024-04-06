@@ -10,7 +10,7 @@ class Control:
         pg.init()
         self.screen = pg.display.set_mode((800, 800))
         self.scale = scale
-        self.robot = Robot(0.1)
+        self.robot = Robot(0.1, display_size)
         self.youBot = assemble_robot()
         self.youBot.arm.park(False)
         self.map = Map((round(-10/scale), round(-10/scale)), (round(20/scale), round(20/scale)), scale)
@@ -19,13 +19,11 @@ class Control:
         self.path = []
 
 
-    def go_to(self, display_coords: tuple[int, int]):
+    def go_to(self, target: np.ndarray):
         start = np.array(self.youBot.platform.ref.get_xy())
-        x, y = self.display.display2absolute(np.array(display_coords))
         try:
-            trajectory = self.navigator.go_to(start, np.array([x, -y]), 'rrt')
+            trajectory = self.navigator.go_to(start, target, 'rrt')
             self.path = list(np.vstack([np.linspace(trajectory[i], point, 5, endpoint=False) for i, point in enumerate(trajectory[1:])]))
-            # self.path = [np.linspace(trajectory[i], point, 5) for i, point in enumerate(trajectory[1:])]
         except:
             print('Pathfinding error')
         
@@ -38,14 +36,11 @@ class Control:
         if all([rrt.check_intersection(self.path[i], point, 20) for i, point in enumerate(self.path[1:])]):
             self.youBot.platform.travel_to(tuple(self.path[-1]))
             self.path.pop()
+            if not self.path:
+                print('Destination reached!')
         else:
             print('Path obstructed. Refinding...')
-            start = np.array(self.youBot.platform.ref.get_xy())
-            try:
-                trajectory = self.navigator.go_to(start, self.path[0], 'rrt')
-                self.path = list(np.vstack([np.linspace(trajectory[i], point, 5, endpoint=False) for i, point in enumerate(trajectory[1:])]))
-            except:
-                print('Pathfinding error')
+            self.go_to(self.path[0])
     
     
     def visualize(self):
@@ -59,7 +54,7 @@ class Control:
             self.map.update(cloud2map(cloud[:2].transpose(), self.scale))
             
             x, y = self.youBot.platform.ref.get_xy()
-            pos = self.display.absolute2display(np.array([x, -y]))
+            pos = self.display.absolute2display(np.array([x, y]))
             self.robot.move(np.array([*pos, self.youBot.platform.ref.get_azimuth()]))
             robot.update()
             display.update()
@@ -69,7 +64,7 @@ class Control:
                     running = False
                 elif event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
                     print('Finding path...')
-                    self.go_to(event.pos)
+                    self.go_to(self.display.display2absolute(np.array(event.pos)))
                         
             self.screen.fill((128, 128, 128))
             if self.path:
