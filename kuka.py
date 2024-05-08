@@ -1,13 +1,15 @@
-from cmath import isnan
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import reduce
 import struct
 from typing import Callable
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 from math import pi as PI
-from math import (atan, atan2, acos, sin, cos)
+from math import (atan, atan2, acos, sin, cos, prod)
 import numpy as np
 from time import sleep
+from multiprocessing import Process, Lock, Queue
+from threading import Thread
 
 
 class Sim:
@@ -16,7 +18,8 @@ class Sim:
     client = RemoteAPIClient()
     sim = client.getObject('sim')
     client.setStepping(False)
-    verbose = True   
+    verbose = True
+    lock = Lock()
 
 
 class Angle:
@@ -148,7 +151,8 @@ class SimObject:
     def __init__(self, path: str) -> None:
         '''Creates sim object.'''
         
-        self._obj = Sim.sim.getObject(path)  
+        with Sim.lock:
+            self._obj = Sim.sim.getObject(path)  
     
     
     def get_pose(self) -> Pose:
@@ -166,20 +170,29 @@ class SimObject:
     def get_pos(self) -> tuple[float, float, float]:
         '''Gets the decart coordinates of the object.'''
         
-        coords = Sim.sim.getObjectPosition(self._obj, Sim.sim.handle_world)
+        with Sim.lock:
+            coords = Sim.sim.getObjectPosition(self._obj, Sim.sim.handle_world)
         return coords
     
     
     def get_orient(self) -> tuple[float, float, float]:
         '''Gets euler angles.'''
         
-        return Sim.sim.getObjectOrientation(self._obj, Sim.sim.handle_world)
+        with Sim.lock:
+            return Sim.sim.getObjectOrientation(self._obj, Sim.sim.handle_world)
 
     
     def get_Tait_Bryan(self) -> tuple[float, float, float]:
         '''Gets Tait_Bryan angles.'''
         euler = self.get_orient()
-        return Sim.sim.alphaBetaGammaToYawPitchRoll(*euler)
+        with Sim.lock:
+            return Sim.sim.alphaBetaGammaToYawPitchRoll(*euler)
+        
+        
+    def get_matrix(self) -> np.ndarray:
+        with Sim.lock:
+            matrix = np.array(Sim.sim.getObjectMatrix(self._obj, Sim.sim.handle_world)).reshape((3, 4))
+        return np.vstack((matrix, np.array([0., 0., 0., 1.])))
     
 
     def get_azimuth(self) -> float:
@@ -244,21 +257,30 @@ class VisionSensor(SimObject):
         self.focus = shape[1]/2/np.tan(self.fov/2) # in pixels
         
     
-    def shoot(self, do_rgb: bool = False) -> tuple[tuple, float, np.ndarray]:
-        # Sim.sim.pauseSimulation()
-        angle = self.get_azimuth()
-        pos = self.get_pos()
-        d, res = Sim.sim.getVisionSensorDepth(self._obj)
-        # Sim.sim.startSimulation()
+    def shoot(self, do_rgb: bool = False) -> tuple:
+        matrix = self.get_matrix()
+        
+        with Sim.lock:
+            d, res = Sim.sim.getVisionSensorDepth(self._obj)
         assert tuple(res) == self.shape
-        d = [struct.unpack('f', d[i:i+4])[0] for i in range(0, len(d), 4)]
+        d = struct.unpack(f'{prod(res)}f', d)
         depth = np.array(d).reshape(res)
+        if res[0] == res[1]:
+            depth = depth.transpose()
         
-        if do_rgb:
-            ...
-            # todo: rgb shot
+        if not do_rgb:
+            return matrix, depth
+            
+        with Sim.lock:
+            img, res = Sim.sim.getVisionSensorImg(self._obj)
+        assert tuple(res) == self.shape
+        img = np.array(list(img), dtype=np.uint8).reshape(*res, 3).transpose((1, 0, 2))
+        # import matplotlib.pyplot as plt
+        # plt.imshow(img)
+        # plt.show()
+                
+        return matrix, depth, img
         
-        return pos, angle, depth
     
     
     def filter_depth(self, depth: np.ndarray) -> np.ndarray:
@@ -267,46 +289,64 @@ class VisionSensor(SimObject):
     
     
     def convert_from_uvd(self, u: np.ndarray, v: np.ndarray, d: np.ndarray) -> np.ndarray:
+        # print(u.shape, v.shape)
+        # import matplotlib.pyplot as plt
+        # plt.imshow(d)
+        # plt.show()
         x = ((u - self.center[1]) * d / self.focus).flatten()
         y = ((v - self.center[0]) * d / self.focus).flatten()
         z = d.flatten()
+        # print(x.shape, y.shape, z.shape)
         return np.array([x, y, z])
     
     
-    def camera2global(self, coords: np.ndarray, pos: tuple[float, float], angle: float) -> np.ndarray:
-        a = -angle
-        matrix_z = np.array([   [np.cos(a), -np.sin(a), 0.],
-                                [np.sin(a), np.cos(a), 0.],
-                                [0., 0., 1.]])
+    def camera2global(self, coords: np.ndarray, matrix: np.ndarray) -> np.ndarray:
         x, y, z = coords
-        global_cloud = np.array([z, -x, y])
+        global_cloud = np.array([-y, x, z, np.ones_like(x)])
         # import matplotlib.pyplot as plt
-        # plt.scatter(*global_cloud[:2], s=0.1)
-        # plt.gca().set_aspect('equal')
+        # ax = plt.figure().add_subplot(projection='3d')
+        # ax.scatter(*global_cloud[:3], s=0.01)
+        # ax.set_aspect('equal')
+        # ax.set_xlabel('x')
+        # ax.set_ylabel('y')
+        # ax.set_zlabel('z')
         # plt.title('Облако в системе координат лидара с изменёнными осями')
         # plt.show()
-        rotated = (np.dot(global_cloud.transpose(), matrix_z) + np.array(pos)).transpose()
+        rotated = np.dot(matrix, global_cloud)[:3]
         return rotated
 
     
-    def get_cloud(self) -> np.ndarray:
-        pos, angle, img = self.shoot()
-        depth = self.filter_depth(img)
-        u = np.arange(self.shape[1])
-        v = np.arange(self.shape[0]).transpose()
-        local_cloud = self.convert_from_uvd(u, v, depth)
+    def get_cloud(self, img: np.ndarray, matrix: np.ndarray, topleft: tuple | None = None, bottomright: tuple | None = None) -> np.ndarray:
+        if topleft is not None and bottomright is not None:
+            depth = self.filter_depth(img[topleft[1]:bottomright[1], topleft[0]:bottomright[0]])
+            u = np.arange(topleft[0], bottomright[0]).reshape((1, -1))
+            v = np.arange(topleft[1], bottomright[1]).reshape((-1, 1))
+        else:
+            depth = self.filter_depth(img)
+            u = np.arange(self.shape[1]).reshape((1, -1))
+            v = np.arange(self.shape[0]).reshape((-1, 1))
         # import matplotlib.pyplot as plt
+        # plt.imshow(depth)
+        # plt.show()
+        # print('shape: ', self.shape)
+        local_cloud = self.convert_from_uvd(u, v, depth)
         # plt.scatter(*local_cloud[[0, 2]], s=0.1)
         # plt.gca().set_aspect('equal')
         # plt.title('Облако в системе координат лидара')
         # plt.show()
-        global_cloud = self.camera2global(local_cloud, pos, angle)
-        # plt.scatter(*global_cloud[:2], s=0.1)
-        # plt.gca().set_aspect('equal')
+        global_cloud = self.camera2global(local_cloud, matrix)
+        # import matplotlib.pyplot as plt
+        # ax = plt.figure().add_subplot(projection='3d')
+        # ax.scatter(*global_cloud, s=0.01)
+        # ax.set_aspect('equal')
+        # ax.set_xlabel('x')
+        # ax.set_ylabel('y')
+        # ax.set_zlabel('z')
         # plt.title('Облако в глобальной системе координат')
         # plt.show()
-        return global_cloud[:, ~np.isnan(global_cloud).any(axis=0)]
-
+        # return global_cloud[:, ~np.isnan(global_cloud).any(axis=0)]
+        return global_cloud
+    
 
 class ArmJoint(SimObject):
     '''Represents a joint of manipulator.'''
@@ -323,7 +363,8 @@ class ArmJoint(SimObject):
     def q(self) -> float:
         '''Gets the actual joint angle from sim.'''
         
-        return Sim.sim.getJointPosition(self._obj)
+        with Sim.lock:
+            return Sim.sim.getJointPosition(self._obj)
     
     
     @q.setter
@@ -331,7 +372,8 @@ class ArmJoint(SimObject):
         '''Sets the desired joint angle.'''
         
         self.target = value
-        Sim.sim.setJointTargetPosition(self._obj, value)
+        with Sim.lock:
+            Sim.sim.setJointTargetPosition(self._obj, value)
         
     
     def is_act_finished(self, precision: float = 0.01) -> bool:
@@ -349,7 +391,8 @@ class Gripper(SimObject):
         Does not use the reference which is for debug only.'''
         
         super().__init__(path)
-        self._script = Sim.sim.getScript(Sim.sim.scripttype_childscript, self._obj)
+        with Sim.lock:
+            self._script = Sim.sim.getScript(Sim.sim.scripttype_childscript, self._obj)
         self.ref = reference
         self.release()
 
@@ -358,7 +401,8 @@ class Gripper(SimObject):
         '''Sends the grab command.'''
         
         self._state = 'closed'
-        Sim.sim.callScriptFunction('grab', self._script)
+        with Sim.lock:
+            Sim.sim.callScriptFunction('grab', self._script)
         if wait:
             sleep(1)
                 
@@ -367,7 +411,8 @@ class Gripper(SimObject):
         '''Sends the release command.'''
         
         self._state = 'opened'
-        Sim.sim.callScriptFunction('drop', self._script)
+        with Sim.lock:
+            Sim.sim.callScriptFunction('drop', self._script)
         if wait:
             sleep(1)
         
@@ -405,8 +450,10 @@ class Platform:
                       - fb_vel - lr_vel + rot_vel,
                       - fb_vel + lr_vel + rot_vel]
         
-        for wheel, vel in zip(self._wheels, velocities):
-            Sim.sim.setJointTargetVelocity(wheel._obj, vel)
+        
+        with Sim.lock:
+            for wheel, vel in zip(self._wheels, velocities):
+                Sim.sim.setJointTargetVelocity(wheel._obj, vel)
             
     
     def stop(self) -> None:
@@ -607,7 +654,7 @@ class Arm:
                 q = self.calculate_q(coords if is_cyl else self.decart_to_local(coords), target_orient)
                 if q is None:
                     return
-                print(''.join([f'q{i}: {_.value:.2f}\t' for i, _ in enumerate(q)]))
+                # print(''.join([f'q{i}: {_.value:.2f}\t' for i, _ in enumerate(q)]))
                 self.q = q
         
     
@@ -841,6 +888,7 @@ class YouBot:
             print(f'Pickup point: {pickup_point[0]:.2f}, {pickup_point[1]:.2f}')
             
         self.platform.travel_to(pickup_point)
+        self.platform.rotate_to(point=pickup_point)
     
     
     def go_pick(self, target: SimObject, load_in_storage: bool = True) -> bool:
@@ -920,8 +968,8 @@ class Dispatcher:
         i = self._robot.get_nearest_object(self._tasks[main_priority])
         pose = self._tasks[main_priority].pop(i)
         
-        if len(self._tasks[i]) == 0:
-            self._tasks.pop(i)
+        if len(self._tasks[main_priority]) == 0:
+            self._tasks.pop(main_priority)
             
         return pose
         
@@ -930,9 +978,15 @@ class Dispatcher:
         '''Dispatch robot to fill its storage.'''
               
         has_room = self._robot.storage.get_free_space() > 0 
+        has_room = True
         while has_room and len(self._materials) > 0:
             task = self._materials.pop(self._robot.get_nearest_object(self._materials))
             has_room = self._robot.go_pick(task)
+    
+    
+    def reserve_material(self) -> Brick:
+        '''Reserves brick.'''
+        return self._materials.pop(self._robot.get_nearest_object(self._materials))
     
     
     def build(self) -> None:
@@ -998,11 +1052,12 @@ def assemble_robot(root: str = '/youBot/') -> YouBot:
     arm = Arm(joints, gripper, ref_arm)
     lidar = VisionSensor(f'{root}Lidar', Angle(135, True), (1, 680), 1e-4, 10.)
     
-    cells = [Storage(CylinderCoords(-0.22, -0.1, Angle(10, True))),
-             Storage(CylinderCoords(-0.22, -0.1, Angle(-10, True)))]
-    storage_system = StorageSystem(cells)
+    # cells = [Storage(CylinderCoords(-0.22, -0.1, Angle(10, True))),
+    #          Storage(CylinderCoords(-0.22, -0.1, Angle(-10, True)))]
+    # storage_system = StorageSystem(cells)
     
-    return YouBot(arm, platform, lidar, storage_system)
+    # return YouBot(arm, platform, lidar, storage_system)
+    return YouBot(arm, platform, lidar)
 
 
 def is_point_reached(ref: SimObject, point: tuple, xy_only: bool = False, precision: float = 0.05) -> bool:
@@ -1042,7 +1097,6 @@ def main() -> None:
                     (0.24, 1, 0.075),
                     (0.18, 1, 0.105)]
     
-    sleep(0.05)
     
     bricks = [Brick(f'/Brick{i+1}') for i in range(10)]
     tasks = [Task(Pose(*dest, gamma=PI/2), int(dest[2]/0.03)) for dest in destinations]
@@ -1060,6 +1114,9 @@ def main() -> None:
 
 
 if __name__ == '__main__':
-    Sim.sim.startSimulation()
+    with Sim.lock:
+        Sim.sim.startSimulation()
     main()
+    with Sim.lock:
+        Sim.sim.stopSimulation()
     

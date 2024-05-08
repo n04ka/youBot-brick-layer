@@ -30,6 +30,16 @@ class Map:
         return ~cv2.filter2D(bitmap, -1, kernel).astype(bool)
     
     
+    def find_closest_to(self, target: np.ndarray) -> np.ndarray:
+        t = self.absolute2map(target)
+        bitmap = self.get_bitmap().transpose()
+        reachable_points = np.stack(np.meshgrid(np.arange(bitmap.shape[1]), np.arange(bitmap.shape[0])), axis=-1)[bitmap].reshape(-1, 2)
+        if len(reachable_points) == 0:
+            raise ValueError('No reachable points')
+        closest = min(reachable_points, key=lambda p: np.linalg.norm(t-p))
+        return self.map2absolute(closest)
+    
+    
     def __contains__(self, value) -> bool:
         i = np.array(value)
         low, high = self.limits()
@@ -118,13 +128,13 @@ class RRT_star:
         if not neighbours:
             return
         
-        if self.graph.number_of_nodes() > 2000:
-            self.map.show()
-            nx.draw(self.graph, self.pos, node_size=5, width=1)
-            plt.axis('on')
-            plt.gca().tick_params(left=True, bottom=True, labelleft=True, labelbottom=True)
-            plt.show()    
-            raise RuntimeError('Cannot find the path') 
+        # if self.graph.number_of_nodes() > 1000:
+        #     self.map.show()
+        #     nx.draw(self.graph, self.pos, node_size=5, width=1)
+        #     plt.axis('on')
+        #     plt.gca().tick_params(left=True, bottom=True, labelleft=True, labelbottom=True)
+        #     plt.show()    
+        #     raise RuntimeError('Cannot find the path') 
         
         node = len(self.pos)
         self.pos[node] = new_point
@@ -169,11 +179,11 @@ class RRT_star:
                 i += 1 
 
         
-        # self.map.show()
-        # nx.draw(self.graph, self.pos, node_size=5, width=1)
-        # plt.axis('on')
-        # plt.gca().tick_params(left=True, bottom=True, labelleft=True, labelbottom=True)
-        # plt.show()     
+        self.map.show()
+        nx.draw(self.graph, self.pos, node_size=5, width=1)
+        plt.axis('on')
+        plt.gca().tick_params(left=True, bottom=True, labelleft=True, labelbottom=True)
+        plt.show()     
         path = [finish_node]
         while path[-1]:
             path.append(*self.graph.predecessors(path[-1]))
@@ -260,11 +270,8 @@ class Navigator:
 
 
     def go_to(self, start: np.ndarray, target: np.ndarray, algorithm: str = 'A*') -> list[np.ndarray]:
-        bitmap = self.map.get_bitmap()
-        # plt.subplot(1, 2, 1)
-        # plt.gca().set_aspect('equal')
-        # plt.imshow(bitmap)
         if algorithm == 'A*':
+            bitmap = self.map.get_bitmap()
             self.graph = self.cell_graph(bitmap)
             return self.a_star(self.graph, start, target)
         

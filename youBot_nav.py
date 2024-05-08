@@ -78,4 +78,4 @@ class Control:
 
 
 if __name__ == '__main__':
-    Control(0.1, 4).visualize()
+    Control().visualize()
