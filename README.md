@@ -33,6 +33,7 @@ The purpose of the module is mapping the environment for future path planning.
 The main goal of the vision is to find target objects such as bricks. To achieve this yolov8 was used. You can check full dataset and the model on [my Roboflow project page](https://universe.roboflow.com/bricks-fbqb5/bricks-2). The module outputs point clouds to be analyzed by the next one.
 
 ![segmentation](https://github.com/user-attachments/assets/a8307d51-58d9-4e79-933e-c30104ddf63c)
+![gif](https://github.com/n04ka/youBot-brick-layer/blob/main/%D0%B2%D0%B8%D0%B4%D0%B5%D0%BE%20%D1%81%20%D0%BA%D0%B0%D0%BC%D0%B5%D1%80%D1%8B.gif)
 
 ## Brick orientation detection
 
