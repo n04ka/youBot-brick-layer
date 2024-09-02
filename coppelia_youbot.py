@@ -1,7 +1,6 @@
 from copy import deepcopy
 from dataclasses import dataclass
 import struct
-from typing import Callable
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 from math import pi as PI
 from math import (atan, atan2, acos, sin, cos, prod)
@@ -135,13 +134,6 @@ class Pose:
         
         return self.alpha, self.beta, self.gamma
 
-@dataclass
-class Task:
-    '''Represents a task for a robot.'''
-
-    pose: Pose
-    priority: int = 0
-    
 
 class SimObject:
     '''Represents sim object from CoppeliaSim.'''
@@ -199,55 +191,12 @@ class SimObject:
         return float(Angle(self.get_Tait_Bryan()[2]-PI))
 
 
-class Brick(SimObject):
-    '''Represents brick, wow!'''
-    
-    def __init__(self, path: str) -> None:
-        '''Creates brick.'''
-        
-        super().__init__(path)
-        self.assigned_robot = None
-        self.status = 'idle' # 'assigned', 'traveling', 'delivered'
-    
-    
-    def display_status(func: Callable) -> Callable: # type: ignore
-        '''Decorator.'''
-        
-        def wrapper(self, *args, **kwargs) -> None:
-            func(self, *args, **kwargs)
-            if Sim.verbose:
-                print(f'Brick status: {self.status}')
-        return wrapper
- 
-        
-    @display_status
-    def assign_to(self, robot) -> None:
-        '''Reserve this brick for the robot.'''
-        
-        self.assigned_robot = robot
-        self.status = 'assigned'        
-    
-        
-    @display_status
-    def picked(self) -> None:
-        '''Pick the brick.'''
-        
-        self.status = 'traveling'
-    
-        
-    @display_status
-    def placed(self) -> None:
-        '''Mark the brick as placed to its destination'''
-        
-        self.status = 'delivered'
-
-
 class VisionSensor(SimObject):
     '''Represents a vision sensor'''
     
-    def __init__(self, path: str, fov: Angle, shape: tuple[int, int], near: float, far: float) -> None:
+    def __init__(self, path: str, fov: float, shape: tuple[int, int], near: float, far: float) -> None:
         super().__init__(path)
-        self.fov = float(fov)
+        self.fov = fov
         self.near = near
         self.far = far
         self.shape = shape
@@ -384,14 +333,13 @@ class Gripper(SimObject):
     '''Represents manipulator's gripper.'''
     
     
-    def __init__(self, path: str, reference: SimObject) -> None:
+    def __init__(self, path: str) -> None:
         '''Creates gripper object and sets its state to opened.
         Does not use the reference which is for debug only.'''
         
         super().__init__(path)
         with Sim.lock:
             self._script = Sim.sim.getScript(Sim.sim.scripttype_childscript, self._obj)
-        self.ref = reference
         self.release()
 
 
@@ -503,11 +451,6 @@ class Platform:
         if is_azimuth_reached(self.ref, angle, Platform.precision):
             return 0.0
         
-        # delta1 = angle.value - self.ref.get_azimuth()
-        # delta2 = 2*PI - abs(delta1)
-        # speed = - 1  if abs(delta1) < abs(delta2) else  1
-        # speed *= Platform.speed * delta1 / abs(delta1)
-        
         delta = angle.value - self.ref.get_azimuth()
         speed = Platform.speed * np.sign(delta) * (-1 if abs(delta) <= PI else 1)
         
@@ -596,7 +539,6 @@ class Arm:
         local = from_decart((*self.ref.get_xy(), Arm.h_base_shift), coords)
         local.r += Arm.r_base_shift
         local.alpha = Angle(local.alpha - self.ref.get_azimuth())
-        # print(str(local))
         return local
     
     
@@ -654,13 +596,6 @@ class Arm:
                     return
                 # print(''.join([f'q{i}: {_.value:.2f}\t' for i, _ in enumerate(q)]))
                 self.q = q
-        
-    
-    def move_measure(self, target: tuple[float, float, float], target_orient: Angle, wait: bool = True) -> None:
-        self.move_to(target, target_orient, wait)
-        for c, t, r in zip(['x', 'y', 'z'], target, self.gripper.ref.get_pos()):
-            print(f'\t{c}:\ttarget: {t:.2f}\treal: {r:.2f}\tdelta: {t-r:.2f}')
-        print(f'\tTotal delta:\t {get_dist(target, self.gripper.ref.get_pos()):.3f}')
 
 
     def put(self, target: tuple[float, float, float] | CylinderCoords, target_orient: Angle, dist_above_target: float = 0.04) -> None:
@@ -697,7 +632,7 @@ class Arm:
 
 
     def take(self, target: tuple[float, float, float] | CylinderCoords, target_orient: Angle, dist_above_target: float = 0.04) -> None:
-        '''Puts object in the given coordinates.'''
+        '''Takes object in the given coordinates.'''
         
         is_cyl = isinstance(target, CylinderCoords)
         
@@ -717,156 +652,14 @@ class Arm:
         self.gripper.grab()
     
 
-class Storage:
-    '''Represents a place where robot can store materials.'''
-    
-    def __init__(self, coords: CylinderCoords) -> None:
-        '''Creates an empty place.'''
-        
-        self.coords = coords
-        self._is_occupied = False
-        self._load = None
-        
-    
-    def put(self, load: SimObject) -> None:
-        '''Put the load in the storage place.'''
-               
-        self._is_occupied = True
-        self._load = load
-        
-    
-    def take(self) -> SimObject:
-        '''Take the content from the storage place'''        
-        
-        if self._load is None:
-            raise RuntimeError('Cannot take from an empty storage place')
-        self._is_occupied = False
-        return self._load
-
-
-class StorageSystem:
-    '''Reresents a cluster of storages.'''
-    
-    def __init__(self, cells: list[Storage] = []) -> None:
-        '''Creates a storage system.'''
-        
-        self._cells = cells
-    
-    
-    def get_size(self) -> int:
-        '''Gets the amount of storage cells.'''
-        
-        return len(self._cells)
-    
-    
-    def get_free_space(self) -> int:
-        '''Gets the amount of empty cells.'''
-        
-        return self.audit().count(False)
-    
-    
-    def audit(self) -> list[bool]:
-        '''Gets the current occupation of the system.'''
-        
-        return [cell._is_occupied for cell in self._cells]
-    
-    
-    def get_contents(self) -> set[SimObject]:
-        '''Gets a set of contents.'''
-        
-        contents = set()
-        for cell in self._cells:
-            if cell._is_occupied:
-                contents.add(cell._load)
-        return contents
-    
-    
-    def is_empty(self) -> bool:
-        '''Checks if the system is empty.'''
-        
-        return not any(self.audit())
-        
-    
-    def is_full(self) -> bool:
-        '''Checks if the system is full.'''
-        
-        return all(self.audit())
-    
-    
-    def get_free_place(self) -> int | None:
-        '''Returns index of the first empty cell. Returns None if the system is full.'''
-        
-        if self.is_full():
-            return None
-        return self.audit().index(False)
-    
-    
-    def get_any_load(self) -> int | None:
-        '''Returns index of the first loaded cell. Returns None if the system is empty.'''
-        
-        if self.is_empty():
-            return None
-        return self.audit().index(True)
-    
-    
-    def put(self, load: SimObject) -> CylinderCoords | None:
-        '''Puts the load in the system. Returns coordinates where to place it or None if the system is full.'''
-        
-        i = self.get_free_place()
-        if i is None:
-            return None
-        self._cells[i].put(load)
-        return self._cells[i].coords
-    
-    
-    def get(self) -> tuple[SimObject, CylinderCoords] | None:
-        '''Gets the load from the storage. Returns None if system is empty.'''
-        
-        i = self.get_any_load()
-        if i is None:
-            return None
-        load = self._cells[i].take()
-        coords = self._cells[i].coords
-        return (load, coords)     
-        
-    
 class YouBot:
     '''Represents youBot.'''
     
-    def __init__(self, arm: Arm, platform: Platform, lidar: VisionSensor, storage: StorageSystem = StorageSystem()) -> None:
+    def __init__(self, arm: Arm, platform: Platform) -> None:
         '''Creates the robot from manipulator and platform.'''
         
         self.arm = arm
         self.platform = platform
-        self.storage = storage
-        self.lidar = lidar
-    
-    
-    def load(self, target: SimObject) -> bool:
-        '''Loads the target into the storage. Returns bool status of the operation.'''
-        
-        coords = self.storage.put(target)
-        if coords is None:
-            return False
-        
-        self.arm.put(coords, Angle(self.platform.ref.get_azimuth()), 0.0)
-        q0 = self.arm.q[0]
-        self.arm.go_until((q0, 0, 0, 0, 0))
-        return True
-        
-        
-    def unload(self) -> SimObject | None:
-        '''Takes one item from the storage. Returns None if the storage is empty.'''
-        
-        load = self.storage.get()
-        if load is None:
-            return None
-        item, coords = load
-        
-        self.arm.take(coords, Angle(self.platform.ref.get_azimuth()), 0.0)
-        q0 = self.arm.q[0]
-        self.arm.go_until((q0, 0, 0, 0, 0))
-        return item
     
     
     def approach(self, target: Pose | tuple[float, float]) -> None:
@@ -889,126 +682,20 @@ class YouBot:
         self.platform.rotate_to(point=pickup_point)
     
     
-    def go_pick(self, target: SimObject, load_in_storage: bool = True) -> bool:
-        '''Robot approaches the target, takes it and loads it if needed. Returns bool of the target being loaded in the storage.'''
+    def go_pick(self, target: SimObject):
+        '''Robot approaches the target and picks it'''
         
         self.approach(target.get_pose())
         self.arm.take(target.get_pos(), Angle(target.get_azimuth()))
-        ok = self.load(target) if load_in_storage else False
         self.arm.park(False)
-        return ok
     
     
     def go_place(self, target: Pose) -> None:
         '''Robot approaches the target, places a brick to it.'''
 
         self.approach(target)
-        
-        if self.arm.gripper.is_opened():
-            load = self.unload()
-            if load is None:
-                raise RuntimeError('No bricks in the storage system to place.')            
-            
         self.arm.put(target.get_pos(), Angle(target.gamma))
         self.arm.park(False)
-
-
-    # def deliver(self, brick: Brick) -> None:
-    #     '''Deliver the brick to its destination.'''
-        
-    #     if brick.destination is None:
-    #         raise ValueError('Brick has no destination to deliver')
-        
-    #     brick.assign_to(self)
-    #     self.go_pick(brick)
-    #     brick.picked()
-    #     self.platform.get_back()
-    #     self.go_place(brick.destination)
-    #     brick.placed()
-    #     self.platform.get_back()
-
-
-    def get_nearest_object(self, targets: list[SimObject] | list[Brick] | list[Pose]) -> int:
-        '''Returns the nearest object from the list.'''
-        
-        robot_pos = self.platform.ref.get_xy()
-        distances = [get_dist(robot_pos, target.get_pos(), xy_only=True) for target in targets]
-        return distances.index(min(distances))
-
-
-class Dispatcher:
-    '''Dispatches the tasks to a robot.'''
-    
-    def __init__(self, robot: YouBot, materials: list[Brick], tasks: list[Task]) -> None:
-        '''Creates a dispatcher.'''
-        
-        self._robot = robot
-        self._materials = materials
-        self._tasks = Dispatcher.organize_tasks(tasks)
-    
-    
-    @staticmethod
-    def organize_tasks(tasks: list[Task]) -> dict[int, list[Pose]]:
-        '''Splits the tasks into groups by priority.'''
-        
-        organized = {task.priority : list() for task in tasks}
-        
-        for task in tasks:
-            organized[task.priority].append(task.pose)     
-            
-        return organized       
-            
-            
-    def choose_task(self) -> Pose:
-        '''Chooses the closest task with the highest priority.'''
-    
-        main_priority = min(self._tasks.keys())     # the highest priority means the lowest int
-        i = self._robot.get_nearest_object(self._tasks[main_priority])
-        pose = self._tasks[main_priority].pop(i)
-        
-        if len(self._tasks[main_priority]) == 0:
-            self._tasks.pop(main_priority)
-            
-        return pose
-        
-        
-    def collect(self) -> None:
-        '''Dispatch robot to fill its storage.'''
-              
-        has_room = self._robot.storage.get_free_space() > 0 
-        has_room = True
-        while has_room and len(self._materials) > 0:
-            task = self._materials.pop(self._robot.get_nearest_object(self._materials))
-            has_room = self._robot.go_pick(task)
-    
-    
-    def reserve_material(self) -> Brick:
-        '''Reserves brick.'''
-        return self._materials.pop(self._robot.get_nearest_object(self._materials))
-    
-    
-    def build(self) -> None:
-        '''Dispatch robot to empty its storage by building.'''
-              
-        is_empty = self._robot.storage.is_empty()
-        while not is_empty and len(self._tasks) > 0:
-            pose = self.choose_task()
-            self._robot.go_place(pose)
-            is_empty = self._robot.storage.is_empty()
-
-    
-    def dispatch(self) -> None:
-        '''Controls the robot.'''
-        
-        while len(self._tasks):
-            if len(self._materials) == 0:
-                print('No more bricks')
-                return
-            print('Going to collect bricks')
-            self.collect()
-            print('Going to place bricks')
-            self.build()
-        print('No more tasks')
                
 
 def from_decart(center: tuple[float, float, float], target: tuple[float, float, float]) -> CylinderCoords:
@@ -1044,18 +731,10 @@ def assemble_robot(root: str = '/youBot/') -> YouBot:
     
     lengths = [0.0, 0.0, 0.155, 0.135, 0.218]
     ref_arm = SimObject(f'{root}arm_ref')
-    ref_grip = SimObject(f'./Effector')
-    gripper = Gripper('./Rectangle7', ref_grip)
+    gripper = Gripper('./Rectangle7')
     joints = [ArmJoint(f'{root}youBotArmJoint{i}', lengths[i]) for i in range(5)]
     arm = Arm(joints, gripper, ref_arm)
-    lidar = VisionSensor(f'{root}Lidar', Angle(135, True), (1, 680), 1e-4, 10.)
-    
-    # cells = [Storage(CylinderCoords(-0.22, -0.1, Angle(10, True))),
-    #          Storage(CylinderCoords(-0.22, -0.1, Angle(-10, True)))]
-    # storage_system = StorageSystem(cells)
-    
-    # return YouBot(arm, platform, lidar, storage_system)
-    return YouBot(arm, platform, lidar)
+    return YouBot(arm, platform)
 
 
 def is_point_reached(ref: SimObject, point: tuple, xy_only: bool = False, precision: float = 0.05) -> bool:
@@ -1082,39 +761,4 @@ def compare_poses(pose1: Pose, pose2: Pose) -> None:
         print(f"\t{attribute} delta:\t{pose1.__dict__[attribute]-pose2.__dict__[attribute]:.3f}")
     print(f'\tTotal shift:\t{get_dist(pose1.get_pos(), pose2.get_pos()):.4f}')
 
-
-def main() -> None:
-    destinations = [(0.00, 1, 0.015),
-                    (0.12, 1, 0.015),
-                    (0.24, 1, 0.015),
-                    (0.36, 1, 0.015),
-                    (0.06, 1, 0.045),
-                    (0.18, 1, 0.045),
-                    (0.30, 1, 0.045),
-                    (0.12, 1, 0.075),
-                    (0.24, 1, 0.075),
-                    (0.18, 1, 0.105)]
-    
-    
-    bricks = [Brick(f'/Brick{i+1}') for i in range(10)]
-    tasks = [Task(Pose(*dest, gamma=PI/2), int(dest[2]/0.03)) for dest in destinations]
-      
-    robot = assemble_robot()
-    robot.arm.park(False)
-    
-    Dispatcher(robot, bricks, tasks).dispatch()
-    
-    # for brick in bricks:
-    #     if brick.destination is not None:
-    #         robot.deliver(brick)
-    #         compare_poses(brick.destination, brick.get_pose())
-    print('Done')            
-
-
-if __name__ == '__main__':
-    with Sim.lock:
-        Sim.sim.startSimulation()
-    main()
-    with Sim.lock:
-        Sim.sim.stopSimulation()
     

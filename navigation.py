@@ -23,6 +23,14 @@ class Map:
         return (np.array([self.array.shape[0]-x, y])[::-1] + self.pos) * self.scale
 
     
+    def cut(self, center: np.ndarray, radius: float):
+        c = self.absolute2map(center).astype(int)
+        r = int(radius // self.scale)
+        array = self.array.astype(np.float32)
+        cv2.circle(array, c, r, 0, -1) # type: ignore
+        self.array = array.astype(np.uint32)
+    
+    
     def get_bitmap(self) -> np.ndarray:
         bitmap = cv2.threshold(self.array.astype(np.float32), 10, 1, cv2.THRESH_BINARY)[1]
         kernel = np.zeros([int(np.ceil((0.54**2 + 0.4**2)**.5/self.scale))]*2, int)
@@ -30,13 +38,14 @@ class Map:
         return ~cv2.filter2D(bitmap, -1, kernel).astype(bool)
     
     
-    def find_closest_to(self, target: np.ndarray) -> np.ndarray:
+    def find_closest_to(self, target: np.ndarray, p_from: np.ndarray) -> np.ndarray:
         t = self.absolute2map(target)
+        p_f = self.absolute2map(p_from)
         bitmap = self.get_bitmap().transpose()
         reachable_points = np.stack(np.meshgrid(np.arange(bitmap.shape[1]), np.arange(bitmap.shape[0])), axis=-1)[bitmap].reshape(-1, 2)
         if len(reachable_points) == 0:
             raise ValueError('No reachable points')
-        closest = min(reachable_points, key=lambda p: np.linalg.norm(t-p))
+        closest = min(reachable_points, key=lambda p: np.linalg.norm(t-p) + np.linalg.norm(p_f-p))
         return self.map2absolute(closest)
     
     
@@ -154,9 +163,15 @@ class RRT_star:
     def run(self):
         if not self.bitmap[*self.map.absolute2map(self.finish).astype(np.int16)]:
             raise RuntimeError('Finish in obstacle')
+        if not self.bitmap[*self.map.absolute2map(self.start).astype(np.int16)]:
+            raise RuntimeError('Start in obstacle')
         i = 0
         searching = True
+        iterations = 0
         while searching or i < 200:
+            if iterations > 2000 and searching:
+                raise IndexError('Struggling to find route')
+            iterations += 1
             new_point = np.random.uniform(*np.array(self.map.limits())[::-1]*self.map.scale)
             added_node = self.update_graph(new_point)
             
@@ -179,11 +194,11 @@ class RRT_star:
                 i += 1 
 
         
-        self.map.show()
-        nx.draw(self.graph, self.pos, node_size=5, width=1)
-        plt.axis('on')
-        plt.gca().tick_params(left=True, bottom=True, labelleft=True, labelbottom=True)
-        plt.show()     
+        # self.map.show()
+        # nx.draw(self.graph, self.pos, node_size=5, width=1)
+        # plt.axis('on')
+        # plt.gca().tick_params(left=True, bottom=True, labelleft=True, labelbottom=True)
+        # plt.show()     
         path = [finish_node]
         while path[-1]:
             path.append(*self.graph.predecessors(path[-1]))
